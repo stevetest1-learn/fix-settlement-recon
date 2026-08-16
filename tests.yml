@@ -1,0 +1,73 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package has no runtime dependencies, so the only thing that can
+        # break it across versions is the standard library itself. Worth
+        # checking, since that is also what makes it run under Pyodide.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Verify no runtime dependencies
+        # The zero-dependency property is load-bearing: it is what lets the
+        # same code run in the browser. Assert it rather than trusting it.
+        run: |
+          pip download --no-deps --dest /tmp/whl .
+          python - <<'PY'
+          import pathlib, zipfile, sys
+          whl = next(pathlib.Path("/tmp/whl").glob("*.whl"))
+          meta = zipfile.ZipFile(whl).read(
+              next(n for n in zipfile.ZipFile(whl).namelist()
+                   if n.endswith("METADATA"))).decode()
+          deps = [l for l in meta.splitlines()
+                  if l.startswith("Requires-Dist") and "extra ==" not in l]
+          if deps:
+              sys.exit("Runtime dependencies crept in:\n" + "\n".join(deps))
+          print("Confirmed: no runtime dependencies.")
+          PY
+
+      - name: Verify sample scenarios still produce their breaks
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          from fix_settlement_recon.webbridge import run
+          expected = {
+              "clean-netted": set(),
+              "reverted-payment": {"TX_REVERTED", "NO_CHAIN_EVENT"},
+              "decimals-bug": {"DECIMAL_SCALE_SUSPECT"},
+              "wrong-recipient": {"WRONG_RECIPIENT"},
+              "batch-with-stray": {"NO_FIX_OBLIGATION", "FEE_EXPLAINED_RESIDUAL"},
+              "not-yet-final": {"NOT_YET_FINAL"},
+          }
+          base = pathlib.Path("web/samples")
+          for name, want in expected.items():
+              res = run(json.loads((base / f"{name}.json").read_text()))
+              assert res["ok"], f"{name}: {res.get('error')}"
+              got = {b["code"] for b in res["breaks"]}
+              assert got == want, f"{name}: expected {want}, got {got}"
+              print(f"  {name}: OK")
+          PY
